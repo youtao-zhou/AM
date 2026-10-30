@@ -1,0 +1,11 @@
+/data/*
+!/data/README.md
+!/data/inputs.csv
+/output/
+.Rhistory
+.RData
+.Rproj.user/
+.Renviron
+__pycache__/
+*.py[cod]
+.DS_Store

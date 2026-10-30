@@ -1,0 +1,179 @@
+# AM4 AM2 TWAS visium maps
+source(file.path(Sys.getenv("AM_REPO_DIR", unset = "."), "R", "paths.R"))
+library(data.table)
+library(ggplot2)
+library(patchwork)
+
+setwd(am_data("sp"))
+dir.create("Figure", showWarnings = FALSE)
+
+main_section <- "P15_LUAD"
+supp_sections <- c("P5_LUAD", "P11_LUAD", "P4_LUAD", "P8_LUAD", "P21_LUAD")
+spot_file <- "AM4_TWAS_visium_maps_spot_data.csv.gz"
+font <- "Noto Sans"
+
+if (!file.exists(spot_file)) {
+  suppressPackageStartupMessages({
+    library(Seurat)
+    library(qs)
+  })
+
+  L <- qread("GSE307534_spatial_list.qs", nthreads = 16)
+  dom <- fread("BANKSY/data_domain_am_cd8_26.csv.gz")
+  genes <- fread("AM4_TWAS_visium_maps_twas_genes.csv")$SYMBOL
+
+  spot <- rbindlist(lapply(c(main_section, supp_sections), function(s) {
+    obj <- L[[s]]
+    counts <- GetAssayData(obj, assay = "Spatial", layer = "counts")
+    lib <- Matrix::colSums(counts)
+    keep <- lib >= 500
+    barcodes <- colnames(counts)[keep]
+    g <- intersect(genes, rownames(counts))
+
+    expr <- as.matrix(counts[g, keep, drop = FALSE])
+    expr <- log1p(sweep(expr, 2, lib[keep], "/") * 1e4)
+    twas <- colMeans(t(scale(t(expr))), na.rm = TRUE)
+
+    co <- GetTissueCoordinates(obj)[barcodes, ]
+    domains <- dom[sample == s]
+
+    d <- data.table(
+      section = s,
+      barcode = barcodes,
+      x = co[[2]],
+      y = -co[[1]],
+      AM4 = obj$RCTD_AM_4[keep],
+      AM2 = obj$RCTD_AM_2[keep],
+      tumour = domains$compartment[match(barcodes, domains$barcode)] %in% "Tumor",
+      twas = twas,
+      n_twas_genes = length(g)
+    )
+
+    nn <- RANN::nn2(as.matrix(d[, .(x, y)]), k = 7)$nn.idx
+    d[, twas_smooth := rowMeans(matrix(twas[nn], nrow = nrow(nn)))]
+    d
+  }))
+
+  fwrite(spot, spot_file)
+  rm(L)
+  invisible(gc())
+}
+
+spot <- fread(spot_file)
+
+st <- spot[, .(
+  n_spots = .N,
+  n_twas_genes = n_twas_genes[1],
+  rho_AM4_TWAS = cor(AM4, twas, method = "spearman", use = "complete.obs"),
+  rho_AM2_TWAS = cor(AM2, twas, method = "spearman", use = "complete.obs"),
+  twas_tumour_minus_rest =
+    median(twas[tumour], na.rm = TRUE) -
+      median(twas[!tumour], na.rm = TRUE)
+), by = section]
+
+sec_rho <- fread("AM4_TWAS_visium_maps_section_rho.csv")
+st <- merge(st, sec_rho[, .(section, partial_rho_TWAS_AM4)], by = "section")
+fwrite(st, "AM4_TWAS_visium_maps_statistics.csv")
+
+pal <- list(
+  AM4 = c("#F2F4FB", "#6888F5", "#1F2F8C"),
+  AM2 = c("#FBF2F3", "#E25563", "#8C1F2B"),
+  twas_smooth = c("#FBF7EE", "#D9A43A", "#7A5410")
+)
+
+map_theme <- theme_void(base_family = font, base_size = 10) +
+  theme(
+    text = element_text(colour = "black"),
+    plot.title = element_text(size = 11, hjust = 0.5),
+    legend.position = "bottom",
+    legend.title = element_text(size = 9),
+    legend.text = element_text(size = 8),
+    legend.margin = margin(0, 0, 0, 0),
+    legend.box.spacing = grid::unit(2, "pt"),
+    plot.margin = margin(4, 4, 4, 4)
+  )
+
+cont_map <- function(d, v, title, legend_title) {
+  lim <- quantile(d[[v]], c(0.01, 0.99), na.rm = TRUE)
+  pad <- max(diff(lim) * 1e-6, 1e-8)
+
+  ggplot(d, aes(x, y, colour = .data[[v]])) +
+    geom_point(size = 0.7, shape = 15) +
+    coord_equal(expand = FALSE) +
+    scale_colour_gradientn(
+      colours = pal[[v]],
+      limits = lim + c(-pad, pad),
+      oob = scales::squish,
+      breaks = lim,
+      labels = sprintf("%.2f", lim),
+      name = legend_title,
+      guide = guide_colourbar(
+        title.position = "top",
+        title.hjust = 0.5,
+        direction = "horizontal",
+        barwidth = grid::unit(2, "cm"),
+        barheight = grid::unit(0.22, "cm"),
+        ticks = FALSE
+      )
+    ) +
+    labs(title = title) +
+    map_theme
+}
+
+section_maps <- function(s) {
+  d <- spot[section == s]
+
+  tumor_map <- ggplot(d, aes(x, y, colour = tumour)) +
+    geom_point(size = 0.7, shape = 15) +
+    coord_equal(expand = FALSE) +
+    scale_colour_manual(
+      values = c(`TRUE` = "#7A6A55", `FALSE` = "#EDE9E3"),
+      breaks = c("TRUE", "FALSE"),
+      labels = c("Tumor", "Non-tumor"),
+      name = NULL,
+      guide = guide_legend(
+        direction = "horizontal",
+        override.aes = list(size = 2.5)
+      )
+    ) +
+    labs(title = "Tumor") +
+    map_theme
+
+  wrap_plots(
+    cont_map(d, "AM4", "AM-4", "RCTD weight"),
+    cont_map(d, "AM2", "AM-2", "RCTD weight"),
+    tumor_map,
+    cont_map(d, "twas_smooth", "TWAS Program", "Programme score"),
+    ncol = 2
+  ) +
+    plot_annotation(
+      title = sub("_LUAD$", "", s),
+      theme = theme(
+        plot.title = element_text(
+          family = font, colour = "black",
+          size = 11, hjust = 0.5, face = "bold"
+        )
+      )
+    )
+}
+
+p_main <- section_maps(main_section)
+print(p_main)
+
+ggsave(
+  "Figure/AM4_TWAS_visium_main.pdf",
+  p_main,
+  width = 5.63, height = 4.76,
+  device = cairo_pdf, bg = "white"
+)
+
+for (s in supp_sections) {
+  p <- section_maps(s)
+
+  ggsave(
+    file.path("Figure", paste0("AM4_TWAS_visium_", s, ".pdf")),
+    p,
+    width = 5.63, height = 4.76,
+    device = cairo_pdf, bg = "white"
+  )
+}
